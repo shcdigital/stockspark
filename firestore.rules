@@ -1,0 +1,128 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // =========================================================================
+    // FUNCIONES DE VALIDACIÓN BASADAS EN SEGURIDAD REFORZADA
+    // =========================================================================
+
+    // 1. Verificar que el usuario esté autenticado
+    function estaAutenticado() {
+      return request.auth != null;
+    }
+
+    // 2. Verificar que el email del usuario pertenezca a la Allowlist de 10 usuarios autorizados.
+    // Previene que alguien que logre registrarse en Auth con un email arbitrario pueda operar.
+    function emailAutorizado() {
+      let config = get(/databases/$(database)/documents/config/system);
+      return request.auth.token.email in config.data.allowedEmails;
+    }
+
+    // 3. Obtener los datos del perfil de usuario en la base de datos
+    function getUsuarioActual() {
+      return get(/databases/$(database)/documents/usuarios/$(request.auth.uid)).data;
+    }
+
+    // 4. Verificar que el usuario tenga rol de Admin
+    function esAdmin() {
+      return estaAutenticado() && emailAutorizado() && getUsuarioActual().rol == 'Admin';
+    }
+
+    // 5. Verificar que el usuario tenga rol de Operador o Admin
+    function esOperadorOAdmin() {
+      return estaAutenticado() && emailAutorizado() && 
+        (getUsuarioActual().rol == 'Admin' || getUsuarioActual().rol == 'Operador');
+    }
+
+    // 6. Validación opcional de 2FA (MFA)
+    // Previene el secuestro de sesiones si la contraseña fue comprometida.
+    function pasoPor2FA() {
+      return request.auth.token.firebase.sign_in_second_factor != null;
+    }
+
+    // 7. Verificación de cuota/tamaño de documento para evitar ataques de denegación (DDoS/costos)
+    function payloadTamanoValido() {
+      // Evita escribir objetos extremadamente masivos
+      return request.resource.data.keys().size() <= 30;
+    }
+
+    // =========================================================================
+    // REGLAS POR COLECCIÓN
+    // =========================================================================
+
+    // DENEGAR TODO POR DEFECTO
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // CONFIGURACIÓN GLOBAL (Allowlist, contadores globales)
+    match /config/system {
+      // Cualquier usuario autenticado puede leer la configuración para chequear su acceso
+      allow read: if estaAutenticado();
+      // Solo el Administrador puede modificar la allowlist o contadores
+      allow write: if esAdmin() && payloadTamanoValido();
+    }
+
+    // COLECCIÓN DE USUARIOS (Gestión de los 10 usuarios y sus roles)
+    match /usuarios/{userId} {
+      // Un usuario puede leer su propio perfil para saber su rol, un Admin puede leer todos
+      allow read: if estaAutenticado() && (request.auth.uid == userId || esAdmin());
+      // Solo un Admin puede crear, actualizar o eliminar usuarios del sistema
+      allow write: if esAdmin() && payloadTamanoValido();
+    }
+
+    // COLECCIÓN DE CATEGORÍAS
+    match /categorias/{categoriaId} {
+      // Todos los operadores y admins pueden leer las categorías
+      allow read: if esOperadorOAdmin();
+      // Solo Admin puede crear, editar o borrar categorías.
+      // Previene que un operador elimine por error estructuras del catálogo.
+      allow write: if esAdmin() && payloadTamanoValido();
+    }
+
+    // COLECCIÓN DE SUBCATEGORÍAS (Jerarquía flexible)
+    match /subcategorias/{subcategoriaId} {
+      allow read: if esOperadorOAdmin();
+      // Solo Admin puede gestionar las subcategorias
+      allow write: if esAdmin() && payloadTamanoValido();
+    }
+
+    // COLECCIÓN DE ARTÍCULOS (~1000 items del negocio)
+    match /articulos/{articuloId} {
+      allow read: if esOperadorOAdmin();
+      
+      // Creación y borrado reservados para el Admin
+      allow create, delete: if esAdmin() && payloadTamanoValido();
+      
+      // Actualización permitida a Operadores (para reflejar cambios de stock) y Admins.
+      // SE VALIDAN TIPOS Y RANGOS ESTRICTOS para evitar corrupción de datos.
+      allow update: if esOperadorOAdmin() 
+        && payloadTamanoValido()
+        && request.resource.data.stockActual is number
+        && request.resource.data.stockActual >= 0 // No permitir stock negativo
+        && request.resource.data.precioVenta is number
+        && request.resource.data.precioVenta >= 0
+        && request.resource.data.precioCosto is number
+        && request.resource.data.precioCosto >= 0
+        && request.resource.data.nombre is string
+        && request.resource.data.nombre.size() > 0;
+    }
+
+    // COLECCIÓN DE MOVIMIENTOS DE STOCK (Historial de Entradas, Salidas y Ajustes)
+    match /movimientos/{movimientoId} {
+      // Lectura para todos los operadores y admins
+      allow read: if esOperadorOAdmin();
+      
+      // Operadores y Admins pueden registrar nuevos movimientos
+      allow create: if esOperadorOAdmin()
+        && payloadTamanoValido()
+        && request.resource.data.cantidad is number
+        && request.resource.data.cantidad > 0 // El movimiento debe ser positivo
+        && request.resource.data.tipo in ['ENTRADA', 'SALIDA']
+        && request.resource.data.usuarioId == request.auth.uid; // Asegura que el autor es quien dice ser
+      
+      // NADIE PUEDE MODIFICAR NI ELIMINAR MOVIMIENTOS HISTÓRICOS (Garantía de Auditoría Inmutable)
+      allow update, delete: if false;
+    }
+  }
+}
